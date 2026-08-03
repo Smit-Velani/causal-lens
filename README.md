@@ -10,6 +10,9 @@
 > A causal inference & experimentation platform that goes beyond correlation to measure real treatment effects. Implements CUPED variance reduction, propensity score matching, difference-in-differences, Bayesian A/B testing, and uplift modeling — then validates every method against synthetic experiments with a known ground-truth effect, so the estimators are shown to recover the true effect, not just produce a number. Further validated on the real-world Criteo Uplift dataset. Built with Python, scikit-learn, statsmodels, and Streamlit.
 
 
+**Live demo:** https://causal-lens-smit.streamlit.app/
+
+
 ## Features
 
 **Ground-Truth Validation Harness**
