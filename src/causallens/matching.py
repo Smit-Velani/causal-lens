@@ -19,6 +19,7 @@ import pandas as pd
 from scipy import stats
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
 
 
 def estimate_psm(df, covariates=["X1", "X2", "X3"], caliper_multiplier=0.2,
@@ -36,7 +37,8 @@ def estimate_psm(df, covariates=["X1", "X2", "X3"], caliper_multiplier=0.2,
     treatment = df.treatment.values
     y = df.post_period_metric.values
 
-    ps_model = LogisticRegression()
+    X = StandardScaler().fit_transform(X)
+    ps_model = LogisticRegression(max_iter=1000)
     ps_model.fit(X, treatment)
     propensity = np.clip(ps_model.predict_proba(X)[:, 1], 1e-6, 1 - 1e-6)
     logit_ps = np.log(propensity / (1 - propensity))

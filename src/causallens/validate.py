@@ -12,6 +12,7 @@ number looks right.
 """
 
 import pandas as pd
+from aipw import estimate_aipw, double_robustness_check
 from data_gen import generate_synthetic_experiment
 from did import estimate_did, pre_trends_test, pre_period_gaps
 from matching import (estimate_psm, smd_before_after, plot_smd,
@@ -191,3 +192,50 @@ if __name__ == "__main__":
 
     pd.DataFrame(rows).to_csv("reports/parallel_trends_test.csv", index=False)
     print("\nSaved to reports/parallel_trends_test.csv")
+
+    # ------------------------------------------------------------------
+    # AIPW — doubly robust estimation
+    # ------------------------------------------------------------------
+
+    print("\n" + "=" * 60)
+    print("AIPW vs PSM (seed 0)")
+    print("=" * 60)
+
+    naive0 = (df0.loc[df0.treatment == 1, "post_period_metric"].mean()
+              - df0.loc[df0.treatment == 0, "post_period_metric"].mean())
+    psm0, n_m0, n_t0 = estimate_psm(df0)
+    r0 = estimate_aipw(df0)
+
+    print(f"Naive: {naive0:.4f}  (bias {naive0-5.0:+.4f})")
+    print(f"PSM  : {psm0:.4f}  (bias {psm0-5.0:+.4f})  "
+          f"matched {n_m0}/{n_t0}, no analytic CI")
+    print(f"AIPW : {r0['ate']:.4f}  (bias {r0['ate']-5.0:+.4f})  "
+          f"95% CI ({r0['ci_low']:.4f}, {r0['ci_high']:.4f})  SE {r0['se']:.4f}")
+    print(f"\nAIPW uses all {r0['n']:,} units; PSM discards unmatched controls.")
+    print(f"Effective sample size after weighting: {r0['effective_n']:,.0f} "
+          f"({r0['effective_n']/r0['n']*100:.1f}%), max weight {r0['max_weight']:.2f}")
+
+    print("\n" + "=" * 60)
+    print("DOUBLE ROBUSTNESS CHECK")
+    print("=" * 60)
+    print("Consistent if EITHER model is right. The 'both broken' row is the")
+    print("control that proves the first three are not just an easy problem.\n")
+
+    dr = double_robustness_check(df0)
+    print(dr.to_string(index=False))
+    dr.to_csv("reports/aipw_double_robustness.csv", index=False)
+
+    bb = float(dr.loc[dr.scenario == "Both broken", "ate"].iloc[0])
+    print(f"\n'Both broken' lands at {bb:.4f} against a naive {naive0:.4f} -- "
+          f"with the confounder\nabsent from both models AIPW reduces exactly to "
+          f"the unadjusted difference.")
+    print("\nSaved to reports/aipw_double_robustness.csv")
+
+    print("\n" + "=" * 60)
+    print("OTHER ENTRY POINTS")
+    print("=" * 60)
+    print("Not run here, because each takes minutes on its own:")
+    print("  python src/causallens/sequential.py       peeking simulation, mSPRT")
+    print("  python src/causallens/power.py            MDE, duration, CUPED savings")
+    print("  python src/causallens/lalonde_validate.py external NSW/PSID benchmark")
+    print("  python src/causallens/criteo_validate.py  external uplift benchmark")

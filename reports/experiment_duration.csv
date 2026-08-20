@@ -1,0 +1,6 @@
+mde_sd,n_total,raw_days,days,weeks,bound_by,flag
+0.005,1255822,63.0,63.0,9,sample size,too long
+0.01,313956,16.0,21.0,3,sample size,ok
+0.02,78490,4.0,7.0,1,1-week minimum,ok
+0.05,12560,1.0,7.0,1,1-week minimum,ok
+0.1,3140,1.0,7.0,1,1-week minimum,ok
