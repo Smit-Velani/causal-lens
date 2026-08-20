@@ -12,15 +12,40 @@ import pandas as pd
 import streamlit as st
 
 from data_gen import generate_synthetic_experiment
-from cuped import cuped_adjust, estimate_ate_with_ci
-from did import estimate_did
-from matching import estimate_psm
+from cuped import cuped_adjust, estimate_ate_with_ci, check_residual_correlation
+from did import estimate_did, pre_trends_test, pre_period_gaps
+from matching import estimate_psm, smd_before_after, plot_smd
 from bayesian_ab import bayesian_ab_test
 
 st.set_page_config(page_title="CausalLens", layout="wide")
 st.title("CausalLens — Causal Inference & Experimentation Platform")
 
-tab1, tab2, tab3 = st.tabs(["Ground Truth Validation", "Upload Your Data", "Criteo Uplift (Real Data)"])
+
+# ---------------------------------------------------------------------------
+# Cached generators — sliders re-run the whole script, so avoid regenerating
+# and re-matching identical data on every widget interaction.
+# ---------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def make_data(n, true_ate, confounding_strength, seed=42, n_pre_periods=1, x1_trend=1.0):
+    return generate_synthetic_experiment(
+        n=n, true_ate=true_ate, confounding_strength=confounding_strength,
+        seed=seed, n_pre_periods=n_pre_periods, x1_trend_per_period=x1_trend,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def cached_balance(n, true_ate, confounding_strength, seed=42):
+    df = make_data(n, true_ate, confounding_strength, seed)
+    return smd_before_after(df)
+
+
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Ground Truth Validation",
+    "Upload Your Data",
+    "Criteo Uplift (Real Data)",
+    "Assumption Diagnostics",
+])
 
 # ---------------------------------------------------------------------------
 # TAB 1 — Ground Truth Validation
@@ -41,9 +66,7 @@ with tab1:
     with col3:
         confounding_strength = st.slider("Confounding strength", 0.0, 1.0, 0.5, step=0.1)
 
-    df = generate_synthetic_experiment(
-        n=n, true_ate=true_ate, confounding_strength=confounding_strength, seed=42
-    )
+    df = make_data(n, true_ate, confounding_strength)
 
     naive = (
         df.loc[df.treatment == 1, "post_period_metric"].mean()
@@ -64,11 +87,13 @@ with tab1:
 
     st.caption(
         f"True ATE = {true_ate}. Bars closer to zero mean less bias from confounding. "
-        f"Try dragging confounding to 0 -- all three should converge close to {true_ate}."
+        f"Try dragging confounding to 0 -- all three should converge close to {true_ate}. "
+        f"These are single-run estimates; the 30-seed averages reported in the README "
+        f"are more stable."
     )
 
     st.subheader("CUPED variance reduction (clean experiment only)")
-    df_clean = generate_synthetic_experiment(n=n, true_ate=true_ate, confounding_strength=0.0, seed=42)
+    df_clean = make_data(n, true_ate, 0.0)
     y = df_clean.post_period_metric.values
     x_pre = df_clean.pre_period_metric.values
     treatment = df_clean.treatment.values
@@ -78,15 +103,34 @@ with tab1:
     ate_after, se_after, lo_after, hi_after = estimate_ate_with_ci(y_adj, treatment)
     var_reduction = 1 - (y_adj.var() / y.var())
 
+    width_before = hi_before - lo_before
+    width_after = hi_after - lo_after
+
     c1, c2 = st.columns(2)
-    c1.metric("ATE before CUPED", f"{ate_before:.3f}", f"CI width {hi_before-lo_before:.3f}")
-    c2.metric("ATE after CUPED", f"{ate_after:.3f}", f"CI width {hi_after-lo_after:.3f}")
+    c1.metric(
+        "ATE before CUPED", f"{ate_before:.3f}",
+        f"CI width {width_before:.3f}", delta_color="off",
+    )
+    c2.metric(
+        "ATE after CUPED", f"{ate_after:.3f}",
+        f"-{width_before - width_after:.3f} CI width", delta_color="inverse",
+    )
     st.success(f"Variance reduction: {var_reduction*100:.1f}%")
+
+    corr_before, corr_after, p_after = check_residual_correlation(y, y_adj, x_pre)
+    st.caption(
+        f"Residual correlation check: corr(Y, X_pre) = {corr_before:+.4f} before "
+        f"adjustment, {corr_after:+.6f} after (p = {p_after:.3f}). The covariate's "
+        f"linear signal is removed exactly -- direct proof CUPED worked, rather than "
+        f"inferring it from the narrower interval. Full detail in the Assumption "
+        f"Diagnostics tab."
+    )
 
     st.subheader("Bayesian A/B test (clean experiment only)")
     diff_mean, diff_std, prob_pos, blo, bhi = bayesian_ab_test(y, treatment)
     st.write(f"Posterior mean effect: **{diff_mean:.3f}**, 95% credible interval ({blo:.3f}, {bhi:.3f})")
-    st.write(f"P(treatment > control) = **{prob_pos:.4f}**")
+    prob_display = "> 0.9999" if prob_pos > 0.9999 else f"{prob_pos:.4f}"
+    st.write(f"P(treatment > control) = **{prob_display}**")
 
 
 # ---------------------------------------------------------------------------
@@ -133,10 +177,12 @@ with tab2:
 
                     y_adj, theta = cuped_adjust(y, x_pre)
                     ate_after, se_after, lo_after, hi_after = estimate_ate_with_ci(y_adj, t)
+                    cb, ca, pa = check_residual_correlation(y, y_adj, x_pre)
                     rows.append({
                         "Method": "CUPED-adjusted diff-in-means",
                         "Estimate": f"{ate_after:.3f}",
-                        "Detail": f"95% CI ({lo_after:.3f}, {hi_after:.3f})",
+                        "Detail": f"95% CI ({lo_after:.3f}, {hi_after:.3f}); "
+                                  f"residual corr {cb:+.3f} -> {ca:+.6f}",
                     })
 
                     did_df = pd.DataFrame({
@@ -164,14 +210,36 @@ with tab2:
                     })
 
                 diff_mean, diff_std, prob_pos, blo, bhi = bayesian_ab_test(y, t)
+                prob_txt = ">0.9999" if prob_pos > 0.9999 else f"{prob_pos:.3f}"
                 rows.append({
                     "Method": "Bayesian A/B",
                     "Estimate": f"{diff_mean:.3f}",
-                    "Detail": f"P(treatment>control)={prob_pos:.3f}, CI ({blo:.3f}, {bhi:.3f})",
+                    "Detail": f"P(treatment>control)={prob_txt}, CI ({blo:.3f}, {bhi:.3f})",
                 })
 
                 st.subheader("Results")
                 st.dataframe(pd.DataFrame(rows))
+
+                if covariate_cols:
+                    st.subheader("PSM covariate balance")
+                    st.write(
+                        "A matched estimate is only trustworthy if the covariates it "
+                        "was supposed to balance actually came out balanced."
+                    )
+                    user_balance = smd_before_after(psm_df, covariates=covariate_cols)
+                    st.dataframe(user_balance.style.format({
+                        "smd_before": "{:.4f}", "smd_after": "{:.4f}",
+                        "abs_reduction": "{:.4f}",
+                    }))
+                    n_ok = int(user_balance.balanced_after.sum())
+                    if n_ok == len(user_balance):
+                        st.success(f"All {n_ok} covariates balanced after matching (|SMD| < 0.1).")
+                    else:
+                        st.warning(
+                            f"Only {n_ok}/{len(user_balance)} covariates fall under "
+                            f"|SMD| < 0.1 after matching. Treat the PSM estimate with "
+                            f"caution -- residual imbalance means residual confounding."
+                        )
 
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
@@ -179,7 +247,7 @@ with tab2:
 
 
 # ---------------------------------------------------------------------------
-# TAB 3 — Criteo Uplift (Real Data) — static report from Phase 8
+# TAB 3 — Criteo Uplift (Real Data)
 # ---------------------------------------------------------------------------
 with tab3:
     st.header("Validated on real-world data: Criteo Uplift Dataset")
@@ -201,3 +269,143 @@ with tab3:
         "Full methodology and code: see reports/criteo_validation.md and "
         "src/causallens/criteo_validate.py."
     )
+
+
+# ---------------------------------------------------------------------------
+# TAB 4 — Assumption Diagnostics
+# ---------------------------------------------------------------------------
+with tab4:
+    st.header("Every estimator ships its own assumption diagnostic")
+    st.write(
+        "A correct-looking point estimate is not evidence a method worked -- it "
+        "can be right by luck, or wrong in a way the final number hides. Each "
+        "method below is checked against the specific assumption it depends on, "
+        "independently of whether its headline estimate looks reasonable."
+    )
+
+    st.divider()
+
+    # --- CUPED --------------------------------------------------------------
+    st.subheader("1. CUPED — residual correlation")
+    st.write(
+        "CUPED subtracts the component of the outcome that is linearly "
+        "predictable from a pre-experiment covariate. If it worked, the adjusted "
+        "outcome should retain no linear association with that covariate. This "
+        "is an algebraic guarantee, so the check is exact rather than approximate."
+    )
+
+    df_diag_clean = make_data(10000, 5.0, 0.0)
+    yd = df_diag_clean.post_period_metric.values
+    xd = df_diag_clean.pre_period_metric.values
+    yd_adj, theta_d = cuped_adjust(yd, xd)
+    cb, ca, pa = check_residual_correlation(yd, yd_adj, xd)
+
+    d1, d2, d3 = st.columns(3)
+    d1.metric("theta", f"{theta_d:.4f}")
+    d2.metric("corr(Y, X_pre)", f"{cb:+.4f}")
+    d3.metric("corr(Y_cuped, X_pre)", f"{ca:+.6f}", f"p = {pa:.3f}", delta_color="off")
+
+    st.success(
+        "Residual correlation is zero to machine precision — the covariate's "
+        "linear signal is fully removed."
+    )
+
+    st.divider()
+
+    # --- PSM ----------------------------------------------------------------
+    st.subheader("2. PSM — covariate balance (SMD)")
+    st.write(
+        "Matching is only credible if the covariates it was supposed to balance "
+        "actually came out balanced. Standardized Mean Difference makes imbalance "
+        "comparable across covariates on different scales; |SMD| < 0.1 is the "
+        "conventional threshold."
+    )
+
+    bal_conf = st.slider(
+        "Confounding strength for the balance check", 0.0, 1.0, 0.5, step=0.1,
+        key="bal_conf",
+    )
+    balance = cached_balance(10000, 5.0, bal_conf)
+
+    b1, b2 = st.columns([1, 1])
+    with b1:
+        st.dataframe(balance.style.format({
+            "smd_before": "{:.4f}", "smd_after": "{:.4f}", "abs_reduction": "{:.4f}",
+        }))
+        n_ok = int(balance.balanced_after.sum())
+        st.success(f"{n_ok}/{len(balance)} covariates balanced after matching.")
+    with b2:
+        st.pyplot(plot_smd(balance))
+
+    st.caption(
+        "X1 drives treatment assignment, so it starts imbalanced and is corrected "
+        "by matching. X2 (pure noise) and X3 (effect modifier) do not drive "
+        "assignment and stay balanced throughout — the correction lands on the "
+        "variable that actually mattered, rather than reshuffling indiscriminately. "
+        "Drag confounding to 0 and X1's initial imbalance disappears."
+    )
+
+    st.divider()
+
+    # --- Parallel trends ----------------------------------------------------
+    st.subheader("3. DiD — parallel-trends placebo test")
+    st.write(
+        "Difference-in-Differences assumes that, absent treatment, both groups "
+        "would have trended in parallel. That is an assumption, not a guarantee. "
+        "This test regresses outcome on treatment x period using **pre-treatment "
+        "data only**, where no treatment effect can exist by construction. Any "
+        "non-zero interaction is a pre-existing divergence — exactly what DiD "
+        "assumes away."
+    )
+
+    p1, p2 = st.columns(2)
+    with p1:
+        trend = st.slider(
+            "X1 effect growth per period", 0.0, 2.0, 1.0, step=0.1,
+            help="How much the confounder's influence grows each period. "
+                 "0.0 gives a world where parallel trends holds.",
+        )
+    with p2:
+        n_pre = st.slider("Number of pre-treatment periods", 2, 6, 3)
+
+    df_pt = make_data(10000, 5.0, 0.5, seed=0, n_pre_periods=n_pre, x1_trend=trend)
+    res = pre_trends_test(df_pt)
+    gaps = pre_period_gaps(df_pt)
+    did_pt, _, _ = estimate_did(df_pt)
+
+    g1, g2 = st.columns([1, 1])
+    with g1:
+        st.write("**Treated − control gap, by pre-period**")
+        st.dataframe(gaps.style.format({"treated_minus_control": "{:.4f}"}))
+    with g2:
+        st.line_chart(gaps.set_index("period")["treated_minus_control"])
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Pre-trend coefficient", f"{res['pre_trend_coef']:+.4f}")
+    m2.metric("p-value", f"{res['p_value']:.2e}")
+    m3.metric("Realised DiD bias", f"{did_pt - 5.0:+.4f}")
+
+    if res["parallel_trends_holds"]:
+        st.success(
+            f"**Parallel trends HOLDS** (p = {res['p_value']:.3f}). The gap is flat "
+            f"across pre-periods, so DiD's key assumption is satisfied and its "
+            f"estimate is roughly unbiased ({did_pt - 5.0:+.3f})."
+        )
+        st.caption(
+            "Note the gap may still be large in *level* — DiD differences level "
+            "differences away by design. Only a difference in slope breaks it, "
+            "which is why this test looks at the trend and not the gap size."
+        )
+    else:
+        st.error(
+            f"**Parallel trends VIOLATED** (p = {res['p_value']:.2e}). The groups "
+            f"diverge by {res['pre_trend_coef']:+.3f} per period before treatment "
+            f"even exists — and that pre-trend predicts the realised DiD bias of "
+            f"{did_pt - 5.0:+.3f}."
+        )
+        st.caption(
+            "This is what drives the ~83% CI coverage reported in the README: the "
+            "bias is systematic, not random, so the intervals undercover. Drag the "
+            "growth slider to 0.0 to see the test correctly return a null result — "
+            "a diagnostic that always fails would prove nothing."
+        )
