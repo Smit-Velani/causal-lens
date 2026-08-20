@@ -11,7 +11,7 @@ import pytest
 
 from data_gen import generate_synthetic_experiment
 from cuped import cuped_adjust, check_residual_correlation
-from matching import smd_before_after
+from matching import smd_before_after, naive_paired_ci, bootstrap_psm_ci, rosenbaum_bounds
 from did import pre_trends_test
 
 
@@ -89,3 +89,52 @@ def test_pre_trends_test_requires_multiple_pre_periods():
     df = generate_synthetic_experiment(seed=0)
     with pytest.raises(ValueError, match="at least 2 pre-periods"):
         pre_trends_test(df)
+
+
+def test_bootstrap_ci_covers_true_effect():
+    """The bootstrap interval should contain the known true ATE of 5.0."""
+    df = generate_synthetic_experiment(true_ate=5.0, confounding_strength=0.5, seed=0)
+    ate, lo, hi, boots = bootstrap_psm_ci(df, n_boot=60, seed=0)
+
+    assert lo < hi
+    assert lo <= 5.0 <= hi, f"CI ({lo:.3f}, {hi:.3f}) misses true ATE 5.0"
+    assert len(boots) >= 50, "too many bootstrap replicates failed"
+
+
+def test_bootstrap_se_exceeds_naive_paired_se():
+    """
+    The naive paired SE conditions on the matching as if the propensity model
+    were known. The bootstrap refits it every replicate, so it must come out
+    strictly larger — if it doesn't, the bootstrap isn't re-running the
+    pipeline properly.
+    """
+    df = generate_synthetic_experiment(true_ate=5.0, confounding_strength=0.5, seed=0)
+    _, se_naive, _, _ = naive_paired_ci(df)
+    _, _, _, boots = bootstrap_psm_ci(df, n_boot=60, seed=0)
+
+    assert boots.std(ddof=1) > se_naive
+
+
+def test_rosenbaum_gamma_star_exceeds_one():
+    """
+    A true effect of 5.0 with no hidden bias in the generator should survive
+    a substantial hypothetical confounder. Gamma* = 1 would mean even the
+    slightest hidden bias overturns it.
+    """
+    df = generate_synthetic_experiment(true_ate=5.0, confounding_strength=0.5, seed=0)
+    bounds, gamma_star = rosenbaum_bounds(df)
+
+    assert gamma_star > 1.5
+    assert bounds.loc[bounds.gamma == 1.0, "still_significant"].iloc[0]
+
+
+def test_rosenbaum_bounds_are_monotone():
+    """
+    Larger Gamma allows more hidden bias, so the upper p-value bound must be
+    non-decreasing. A non-monotone sequence means the bound is miscomputed.
+    """
+    df = generate_synthetic_experiment(true_ate=5.0, confounding_strength=0.5, seed=0)
+    bounds, _ = rosenbaum_bounds(df)
+
+    p = bounds.p_upper_bound.values
+    assert all(p[i] <= p[i + 1] + 1e-12 for i in range(len(p) - 1))

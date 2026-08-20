@@ -4,16 +4,19 @@ method across many random seeds and checks bias against the known
 synthetic ground truth. This is the file that proves the project works,
 rather than just claiming it.
 
-Also runs the per-method diagnostics — PSM covariate balance, the CUPED
-residual-correlation check, and a placebo test of DiD's parallel-trends
-assumption — so each estimator is verified on its own terms, not just by
-whether its final number looks right.
+Also runs the per-method diagnostics — PSM covariate balance, bootstrap
+uncertainty, Rosenbaum sensitivity bounds, the CUPED residual-correlation
+check, and a placebo test of DiD's parallel-trends assumption — so each
+estimator is verified on its own terms, not just by whether its final
+number looks right.
 """
 
 import pandas as pd
 from data_gen import generate_synthetic_experiment
 from did import estimate_did, pre_trends_test, pre_period_gaps
-from matching import estimate_psm, smd_before_after, plot_smd
+from matching import (estimate_psm, smd_before_after, plot_smd,
+                      naive_paired_ci, bootstrap_psm_ci, rosenbaum_bounds,
+                      plot_bootstrap)
 from cuped import cuped_adjust, check_residual_correlation
 
 
@@ -66,13 +69,14 @@ if __name__ == "__main__":
     # Diagnostics — each estimator checked on its own assumptions
     # ------------------------------------------------------------------
 
+    df0 = generate_synthetic_experiment(
+        n=10000, true_ate=5.0, confounding_strength=0.5, seed=0
+    )
+
     print("\n" + "=" * 60)
     print("PSM COVARIATE BALANCE (seed 0, confounding_strength=0.5)")
     print("=" * 60)
 
-    df0 = generate_synthetic_experiment(
-        n=10000, true_ate=5.0, confounding_strength=0.5, seed=0
-    )
     balance = smd_before_after(df0)
     print(balance.to_string(index=False))
     balance.to_csv("reports/psm_balance.csv", index=False)
@@ -81,6 +85,52 @@ if __name__ == "__main__":
 
     n_bal = int(balance.balanced_after.sum())
     print(f"Covariates balanced after matching (|SMD| < 0.1): {n_bal}/{len(balance)}")
+
+    # ------------------------------------------------------------------
+    # PSM uncertainty — bootstrap CI and sensitivity to hidden bias
+    # ------------------------------------------------------------------
+
+    print("\n" + "=" * 60)
+    print("PSM BOOTSTRAP CONFIDENCE INTERVAL (seed 0, 500 replicates)")
+    print("=" * 60)
+    print("Refitting the propensity model inside every replicate; this takes a minute.")
+
+    ate_n, se_n, lo_n, hi_n = naive_paired_ci(df0)
+    ate_b, lo_b, hi_b, boots = bootstrap_psm_ci(df0, n_boot=500, seed=0)
+    se_b = boots.std(ddof=1)
+
+    print(f"\nNaive paired CI: ({lo_n:.3f}, {hi_n:.3f})  width {hi_n-lo_n:.3f}  SE {se_n:.4f}")
+    print(f"Bootstrap CI:    ({lo_b:.3f}, {hi_b:.3f})  width {hi_b-lo_b:.3f}  SE {se_b:.4f}")
+    print(f"SE inflation:    {(se_b/se_n - 1)*100:.1f}% -- the cost of having "
+          f"estimated the propensity model rather than known it")
+    print(f"Covers true ATE 5.0: {lo_b <= 5.0 <= hi_b}")
+
+    plot_bootstrap(boots, ate_b, lo_b, hi_b, true_ate=5.0,
+                   save_path="reports/psm_bootstrap.png")
+    pd.DataFrame([{
+        "ate": ate_b,
+        "naive_se": se_n, "naive_lo": lo_n, "naive_hi": hi_n,
+        "boot_se": se_b, "boot_lo": lo_b, "boot_hi": hi_b,
+        "n_replicates": len(boots),
+        "se_inflation_pct": (se_b / se_n - 1) * 100,
+    }]).to_csv("reports/psm_bootstrap.csv", index=False)
+    print("\nSaved to reports/psm_bootstrap.csv and reports/psm_bootstrap.png")
+
+    print("\n" + "=" * 60)
+    print("ROSENBAUM SENSITIVITY BOUNDS (seed 0)")
+    print("=" * 60)
+
+    bounds, gamma_star = rosenbaum_bounds(df0)
+    print(bounds.to_string(index=False))
+    bounds.to_csv("reports/rosenbaum_bounds.csv", index=False)
+    print()
+    print(f"Gamma* = {gamma_star:.2f}")
+    print(
+        f"An unmeasured confounder would have to shift the odds of treatment by "
+        f"more than {gamma_star:.2f}x, between units identical on every measured "
+        f"covariate, before this result stops being significant."
+    )
+    print("\nSaved to reports/rosenbaum_bounds.csv")
 
     print("\n" + "=" * 60)
     print("CUPED RESIDUAL CORRELATION (seed 0, clean experiment)")

@@ -5,12 +5,18 @@ Corrects for confounded (non-randomized) treatment assignment by matching
 each treated unit to a control unit with a similar propensity score
 (P(treatment=1 | covariates)), then comparing outcomes within matched pairs.
 
-Includes SMD covariate-balance diagnostics — matching is only credible if
-the covariates it was supposed to balance actually came out balanced.
+Ships three diagnostics alongside the estimate, because a matched point
+estimate on its own says nothing about whether matching worked:
+
+  - SMD covariate balance: did the covariates actually come out balanced?
+  - Bootstrap confidence interval: how much sampling uncertainty is there?
+  - Rosenbaum sensitivity bounds: how strong would an unmeasured confounder
+    have to be to overturn the conclusion?
 """
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import NearestNeighbors
 
@@ -106,6 +112,169 @@ def smd_before_after(df, covariates=["X1", "X2", "X3"], caliper_multiplier=0.2):
     return out
 
 
+def naive_paired_ci(df, covariates=["X1", "X2", "X3"], caliper_multiplier=0.2,
+                    alpha=0.05):
+    """
+    The interval you get by treating the matched pairs as if they were a
+    simple paired sample: SE = sd(pair differences) / sqrt(n_pairs).
+
+    This is what most implementations report, and it is too narrow. It
+    conditions on the matching as though the propensity model were known
+    rather than estimated, so it ignores a whole layer of uncertainty.
+    Included here specifically so it can be compared against the bootstrap
+    interval below -- the gap between the two is the cost of pretending
+    the propensity model was free.
+    """
+    _, _, _, m = estimate_psm(df, covariates, caliper_multiplier, return_matches=True)
+    y = df.post_period_metric.values
+    diffs = y[m["matched_treated"]] - y[m["matched_control"]]
+
+    ate = diffs.mean()
+    se = diffs.std(ddof=1) / np.sqrt(len(diffs))
+    z = stats.norm.ppf(1 - alpha / 2)
+    return ate, se, ate - z * se, ate + z * se
+
+
+def bootstrap_psm_ci(df, covariates=["X1", "X2", "X3"], caliper_multiplier=0.2,
+                     n_boot=200, alpha=0.05, seed=0, verbose=False):
+    """
+    Percentile bootstrap confidence interval for the PSM estimate.
+
+    The whole pipeline is re-run inside each bootstrap replicate: resample
+    units with replacement, refit the propensity model on the resampled
+    data, rematch, recompute the ATE. Resampling only the matched pairs
+    would treat the matching as fixed and understate uncertainty, since
+    the propensity scores were estimated from the same data.
+
+    KNOWN CAVEAT -- Abadie & Imbens (2008) showed the standard bootstrap is
+    not formally valid for nearest-neighbour matching estimators with a
+    fixed number of matches: the matching function is not smooth enough for
+    the bootstrap's asymptotic guarantees to hold, and the resulting
+    intervals can have incorrect coverage in either direction. This is
+    reported as an approximation and a clear improvement over the naive
+    paired interval, not as a formally correct one. A formally valid
+    alternative is the Abadie-Imbens analytic variance estimator, which is
+    not implemented here.
+
+    Returns (ate, ci_low, ci_high, boot_estimates).
+    """
+    rng = np.random.default_rng(seed)
+    n = len(df)
+
+    ate, _, _ = estimate_psm(df, covariates, caliper_multiplier)
+
+    boot_estimates = []
+    failures = 0
+    for b in range(n_boot):
+        boot_idx = rng.integers(0, n, size=n)
+        boot_df = df.iloc[boot_idx].reset_index(drop=True)
+
+        # A resample can end up with one arm empty or too small to match.
+        if boot_df.treatment.nunique() < 2:
+            failures += 1
+            continue
+        try:
+            est, n_matched, _ = estimate_psm(boot_df, covariates, caliper_multiplier)
+            if n_matched > 0 and np.isfinite(est):
+                boot_estimates.append(est)
+            else:
+                failures += 1
+        except Exception:
+            failures += 1
+
+        if verbose and (b + 1) % 50 == 0:
+            print(f"  bootstrap {b+1}/{n_boot}")
+
+    boot_estimates = np.array(boot_estimates)
+    if len(boot_estimates) < 20:
+        raise RuntimeError(
+            f"Only {len(boot_estimates)} of {n_boot} bootstrap replicates "
+            f"succeeded -- too few for a usable interval."
+        )
+
+    lo = np.percentile(boot_estimates, 100 * alpha / 2)
+    hi = np.percentile(boot_estimates, 100 * (1 - alpha / 2))
+    return ate, lo, hi, boot_estimates
+
+
+def rosenbaum_bounds(df, covariates=["X1", "X2", "X3"], caliper_multiplier=0.2,
+                     gammas=None, alpha=0.05):
+    """
+    Rosenbaum sensitivity analysis for unmeasured confounding.
+
+    Matching only balances covariates you measured. The obvious objection
+    to any PSM result is "what about a confounder you didn't observe?" --
+    and it cannot be answered from the data, because the confounder is by
+    definition unobserved. What Rosenbaum bounds do instead is quantify how
+    strong such a confounder would have to be before the conclusion breaks.
+
+    Gamma is the odds ratio by which an unmeasured confounder could shift a
+    unit's probability of being treated. Gamma = 1 means no hidden bias --
+    within a matched pair, either unit was equally likely to be treated.
+    Gamma = 2 means one unit could have been twice as likely as its match,
+    despite being identical on every measured covariate.
+
+    For each Gamma, the Wilcoxon signed-rank test on pair differences is
+    bounded under the most and least favourable assignment patterns
+    consistent with that Gamma. Gamma* is the point at which the upper
+    bound crosses alpha -- the smallest hidden bias that could explain the
+    result away.
+
+    Interpretation: a high Gamma* means the finding is robust; a Gamma*
+    near 1 means even slight hidden bias could account for it.
+
+    Returns (bounds_df, gamma_critical).
+    """
+    if gammas is None:
+        gammas = [1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.1, 2.2, 2.3, 2.4,
+                  2.5, 2.75, 3.0, 4.0, 5.0, 7.0, 10.0]
+
+    _, _, _, m = estimate_psm(df, covariates, caliper_multiplier, return_matches=True)
+    y = df.post_period_metric.values
+    diffs = y[m["matched_treated"]] - y[m["matched_control"]]
+
+    # Wilcoxon signed-rank: drop zero differences, rank by absolute value,
+    # sum the ranks belonging to positive differences.
+    diffs = diffs[diffs != 0]
+    n = len(diffs)
+    if n < 10:
+        raise ValueError(f"Only {n} non-zero pair differences -- too few.")
+
+    ranks = stats.rankdata(np.abs(diffs))
+    w_plus = ranks[diffs > 0].sum()
+
+    total_rank = n * (n + 1) / 2
+    rank_sq_sum = n * (n + 1) * (2 * n + 1) / 6
+
+    rows = []
+    for g in gammas:
+        p_hi = g / (1 + g)     # worst case: treatment favoured -> largest null mean
+        p_lo = 1 / (1 + g)     # best case
+
+        # Upper bound on the p-value uses the null distribution shifted up,
+        # making the observed statistic look least extreme.
+        mu_hi = p_hi * total_rank
+        sd_hi = np.sqrt(p_hi * (1 - p_hi) * rank_sq_sum)
+        p_upper = 1 - stats.norm.cdf((w_plus - mu_hi) / sd_hi)
+
+        mu_lo = p_lo * total_rank
+        sd_lo = np.sqrt(p_lo * (1 - p_lo) * rank_sq_sum)
+        p_lower = 1 - stats.norm.cdf((w_plus - mu_lo) / sd_lo)
+
+        rows.append({
+            "gamma": g,
+            "p_lower_bound": p_lower,
+            "p_upper_bound": p_upper,
+            "still_significant": bool(p_upper < alpha),
+        })
+
+    bounds = pd.DataFrame(rows)
+
+    sig = bounds[bounds.still_significant]
+    gamma_critical = float(sig.gamma.max()) if len(sig) else 1.0
+    return bounds, gamma_critical
+
+
 def plot_smd(balance_df, save_path=None):
     """
     Love plot — the standard way to present PSM balance. One row per
@@ -136,6 +305,28 @@ def plot_smd(balance_df, save_path=None):
     return fig
 
 
+def plot_bootstrap(boot_estimates, ate, lo, hi, true_ate=None, save_path=None):
+    """Bootstrap sampling distribution with the percentile interval marked."""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.hist(boot_estimates, bins=40, alpha=0.75, edgecolor="white")
+    ax.axvline(ate, color="black", lw=2, label=f"PSM estimate {ate:.3f}")
+    ax.axvline(lo, color="grey", ls="--", lw=1.5, label=f"95% CI ({lo:.3f}, {hi:.3f})")
+    ax.axvline(hi, color="grey", ls="--", lw=1.5)
+    if true_ate is not None:
+        ax.axvline(true_ate, color="crimson", lw=2, ls=":", label=f"True ATE {true_ate}")
+    ax.set_xlabel("Bootstrap PSM estimate")
+    ax.set_ylabel("Frequency")
+    ax.set_title(f"Bootstrap distribution ({len(boot_estimates)} replicates)")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    return fig
+
+
 if __name__ == "__main__":
     from data_gen import generate_synthetic_experiment
 
@@ -157,8 +348,40 @@ if __name__ == "__main__":
         print(balance.to_string(index=False))
         print()
 
-    # Love plot for the confounded case
     df = generate_synthetic_experiment(true_ate=5.0, confounding_strength=0.5)
     balance = smd_before_after(df)
     plot_smd(balance, save_path="reports/psm_balance.png")
     print("Saved Love plot to reports/psm_balance.png")
+
+    print("\n" + "=" * 60)
+    print("BOOTSTRAP CONFIDENCE INTERVAL")
+    print("=" * 60)
+
+    ate_n, se_n, lo_n, hi_n = naive_paired_ci(df)
+    print(f"Naive paired CI:  {ate_n:.3f}  95% CI ({lo_n:.3f}, {hi_n:.3f})  "
+          f"width {hi_n-lo_n:.3f}")
+
+    print("Running 200 bootstrap replicates (refits propensity each time)...")
+    ate_b, lo_b, hi_b, boots = bootstrap_psm_ci(df, n_boot=200, verbose=True)
+    print(f"Bootstrap CI:     {ate_b:.3f}  95% CI ({lo_b:.3f}, {hi_b:.3f})  "
+          f"width {hi_b-lo_b:.3f}")
+    print(f"Bootstrap SE:     {boots.std(ddof=1):.4f}   (naive SE {se_n:.4f})")
+    print(f"Covers true ATE 5.0: {lo_b <= 5.0 <= hi_b}")
+
+    plot_bootstrap(boots, ate_b, lo_b, hi_b, true_ate=5.0,
+                   save_path="reports/psm_bootstrap.png")
+    print("Saved bootstrap plot to reports/psm_bootstrap.png")
+
+    print("\n" + "=" * 60)
+    print("ROSENBAUM SENSITIVITY BOUNDS")
+    print("=" * 60)
+
+    bounds, gamma_star = rosenbaum_bounds(df)
+    print(bounds.to_string(index=False))
+    print()
+    print(f"Gamma* = {gamma_star:.2f}")
+    print(
+        f"An unmeasured confounder would need to shift the odds of treatment "
+        f"by a factor of more than {gamma_star:.2f}, for units identical on "
+        f"every measured covariate, before this result stops being significant."
+    )
