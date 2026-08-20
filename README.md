@@ -189,7 +189,7 @@ pytest tests/ -v
 
 - DiD's 95% CI has measured coverage of ~83%, not the nominal 95%. The parallel-trends placebo test traces this to a +0.450/period pre-existing divergence between the groups, driven by the confounder's effect growing across periods in the generator design. This is a diagnosed and quantified failure mode kept deliberately in place — a validation harness that always reports "everything's perfect" is less convincing than one that catches, explains, and reproduces a real edge case.
 - The parallel-trends test requires at least two pre-treatment periods. In a single-pre-period design the assumption is structurally untestable, since only a level difference is observable and DiD differences that away by construction.
-- The "Upload Your Data" tab assumes numeric treatment (0/1) and outcome columns; it does not yet handle categorical treatment coding or missing data.
+- The "Upload Your Data" tab does not impute missing values or encode categorical columns — it detects both and declines with a specific message, since dropping rows or choosing an encoding changes which units are comparable and is a modelling decision that belongs to the analyst rather than the tool.
 - PSM reports a point estimate without a confidence interval; matched-pair uncertainty would need a bootstrap, which is not yet implemented.
 - No sensitivity analysis for unmeasured confounding — PSM only balances covariates it can observe.
 - Criteo validation uses a representative subsample (223,673 rows) rather than the full multi-million-row dataset, for local runtime practicality.
