@@ -129,8 +129,10 @@ with tab1:
     st.subheader("Bayesian A/B test (clean experiment only)")
     diff_mean, diff_std, prob_pos, blo, bhi = bayesian_ab_test(y, treatment)
     st.write(f"Posterior mean effect: **{diff_mean:.3f}**, 95% credible interval ({blo:.3f}, {bhi:.3f})")
-    prob_display = "> 0.9999" if prob_pos > 0.9999 else f"{prob_pos:.4f}"
-    st.write(f"P(treatment > control) = **{prob_display}**")
+    if prob_pos > 0.9999:
+        st.write("P(treatment > control) = **>0.9999**")
+    else:
+        st.write(f"P(treatment > control) = **{prob_pos:.4f}**")
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +168,26 @@ with tab2:
 
         if st.button("Run analysis"):
             try:
+                check_cols = [treatment_col, outcome_col] + list(covariate_cols)
+                if pre_period_col != "(none)":
+                    check_cols.append(pre_period_col)
+
+                na_counts = {c: int(user_df[c].isna().sum()) for c in check_cols}
+                bad = {c: n for c, n in na_counts.items() if n > 0}
+                if bad:
+                    st.error(
+                        "Missing values found in: "
+                        + ", ".join(f"**{c}** ({n:,} rows)" for c, n in bad.items())
+                    )
+                    st.info(
+                        "This tab does not impute missing data — dropping rows with "
+                        "missing covariates would change which units are comparable, "
+                        "which is a modelling decision that belongs to you, not the tool. "
+                        "Either deselect these columns, or impute them upstream and "
+                        "re-upload."
+                    )
+                    st.stop()
+
                 t = user_df[treatment_col].values.astype(int)
                 y = user_df[outcome_col].values.astype(float)
 
@@ -220,6 +242,12 @@ with tab2:
                 st.subheader("Results")
                 st.dataframe(pd.DataFrame(rows))
 
+                if pre_period_col == "(none)":
+                    st.info(
+                        "CUPED and Difference-in-Differences were skipped — both need a "
+                        "pre-experiment covariate column, and none was selected."
+                    )
+
                 if covariate_cols:
                     st.subheader("PSM covariate balance")
                     st.write(
@@ -241,9 +269,19 @@ with tab2:
                             f"caution -- residual imbalance means residual confounding."
                         )
 
+            except ValueError as e:
+                st.error(f"Could not run the analysis: {e}")
+                st.info(
+                    "Most common causes: the treatment column is not coded 0/1, or a "
+                    "selected column is categorical text rather than numeric. Categorical "
+                    "covariates need one-hot encoding before upload."
+                )
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
-                st.info("Check that the treatment column is 0/1 and outcome/covariate columns are numeric.")
+                st.info(
+                    "Check that the treatment column is 0/1 and that outcome and "
+                    "covariate columns are numeric with no missing values."
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +341,8 @@ with tab4:
     d1, d2, d3 = st.columns(3)
     d1.metric("theta", f"{theta_d:.4f}")
     d2.metric("corr(Y, X_pre)", f"{cb:+.4f}")
-    d3.metric("corr(Y_cuped, X_pre)", f"{ca:+.6f}", f"p = {pa:.3f}", delta_color="off")
+    d3.metric("corr(Y_cuped, X_pre)", f"{ca:+.6f}")
+    st.caption(f"p = {pa:.3f} on the post-adjustment correlation.")
 
     st.success(
         "Residual correlation is zero to machine precision — the covariate's "
