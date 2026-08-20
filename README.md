@@ -109,7 +109,7 @@ The pre-trend is measured entirely before treatment exists, and it predicts the 
     |   +-- streamlit_app.py     Interactive 3-tab app
     |
     +-- tests/
-    |   +-- test_*.py            pytest suite (8 tests)
+    |   +-- test_*.py            pytest suite (13 tests)
     |   +-- conftest.py
     |
     +-- reports/
